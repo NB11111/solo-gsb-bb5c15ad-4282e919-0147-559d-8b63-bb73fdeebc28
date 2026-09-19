@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>匿名评审分配系统</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⚖️</span>
+      <div>
+        <h1>匿名评审分配系统</h1>
+        <p class="subtitle">最小费用最大流 · 冲突与机构多样性硬约束 · 主题匹配与负载均衡联合优化</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="btn-solve" class="btn primary">▶ 重新求解分配</button>
+      <button id="btn-demo" class="btn ghost">载入演示数据</button>
+      <button id="btn-reset" class="btn danger-ghost">清空全部</button>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="overview">分配结果</button>
+    <button class="tab" data-tab="manuscripts">稿件</button>
+    <button class="tab" data-tab="reviewers">评审人</button>
+    <button class="tab" data-tab="conflicts">作者冲突</button>
+  </nav>
+
+  <main>
+    <!-- ============================ 分配结果 ============================ -->
+    <section id="tab-overview" class="tab-panel active">
+      <div id="summary-cards" class="summary-grid"></div>
+
+      <div id="warnings-box"></div>
+      <div id="unmet-box"></div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>完整分配</h2>
+          <p class="hint">点击评审人徽章上的 🔒 可锁定/解锁该既有分配；锁定立即重新求解并占用容量。也可用“锁定其他评审人”手工锁定。</p>
+        </div>
+        <div id="assignment-list"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>评审人负载</h2></div>
+        <div id="reviewer-load"></div>
+      </div>
+
+      <details class="panel settings-panel">
+        <summary class="panel-head"><h2>求解参数与默认值</h2></summary>
+        <div class="settings-grid">
+          <label>默认每稿评审数
+            <input type="number" id="set-default-req" min="1" max="20" />
+          </label>
+          <label>默认个人容量
+            <input type="number" id="set-default-cap" min="0" max="50" />
+          </label>
+          <label>主题不匹配权重 β
+            <input type="number" id="set-beta" min="0" />
+          </label>
+          <label>负载偏差权重 α
+            <input type="number" id="set-alpha" min="0" />
+          </label>
+          <label>每篇稿件同机构最多人数（0 关闭）
+            <input type="number" id="set-inst-cap" min="0" max="20" />
+          </label>
+          <div class="settings-actions">
+            <button id="btn-save-settings" class="btn">保存设置</button>
+            <span class="hint">权重修改后请点击“重新求解分配”生效。</span>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================ 稿件 ============================ -->
+    <section id="tab-manuscripts" class="tab-panel">
+      <div class="panel">
+        <div class="panel-head"><h2>录入稿件</h2></div>
+        <form id="form-manuscript" class="form-row">
+          <input type="text" name="title" placeholder="稿件主题 / 标题" required maxlength="200" />
+          <input type="text" name="topics" placeholder="主题（逗号分隔，如：机器学习, nlp）" />
+          <input type="number" name="required_reviews" placeholder="所需评审数" min="1" max="20" />
+          <button class="btn primary" type="submit">添加稿件</button>
+        </form>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>稿件列表</h2></div>
+        <div id="manuscript-list"></div>
+      </div>
+    </section>
+
+    <!-- ============================ 评审人 ============================ -->
+    <section id="tab-reviewers" class="tab-panel">
+      <div class="panel">
+        <div class="panel-head"><h2>录入评审人</h2></div>
+        <form id="form-reviewer" class="form-row">
+          <input type="text" name="name" placeholder="评审人姓名 / 代号" required maxlength="100" />
+          <input type="text" name="topics" placeholder="擅长主题（逗号分隔）" />
+          <input type="text" name="institution" placeholder="所属机构（可选，留空不计入机构上限）" maxlength="120" />
+          <input type="number" name="capacity" placeholder="个人容量" min="0" max="50" />
+          <button class="btn primary" type="submit">添加评审人</button>
+        </form>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>评审人列表</h2></div>
+        <div id="reviewer-list"></div>
+      </div>
+    </section>
+
+    <!-- ============================ 冲突 ============================ -->
+    <section id="tab-conflicts" class="tab-panel">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>作者冲突矩阵</h2>
+          <p class="hint">勾选表示该稿件与该评审人存在作者冲突；冲突边在求解图中根本不会建立，因此绝不可能被分配。已锁定的分配需先解锁才能勾选冲突。</p>
+        </div>
+        <div id="conflict-matrix" class="matrix-wrap"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 通用编辑弹窗 -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <h3 id="modal-title"></h3>
+      <div id="modal-body"></div>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="btn ghost">取消</button>
+        <button id="modal-ok" class="btn primary">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
