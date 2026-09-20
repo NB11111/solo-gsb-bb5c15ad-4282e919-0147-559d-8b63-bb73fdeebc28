@@ -64,9 +64,12 @@ function renderSummary() {
   const sol = state.solution;
   const cards = [];
   if (sol) {
+    const chairsOk = sol.total_chairs_assigned >= (sol.total_chairs_required || 0);
     cards.push(
       stat(sol.total_assigned, `已满足评审数（共需 ${sol.total_required}）`,
         sol.total_assigned >= sol.total_required ? "ok" : "bad"),
+      stat(sol.total_chairs_assigned, `已任主审数（共需 ${sol.total_chairs_required || 0}）`,
+        chairsOk ? "ok" : "bad"),
       stat(sol.fully_satisfied ? "完整" : `${sol.unmet.length} 篇未满足`,
         "分配完整性", sol.fully_satisfied ? "ok" : "bad"),
       stat(sol.total_cost, "目标函数总费用（越小越优）"),
@@ -110,6 +113,9 @@ function renderAlerts() {
     const detailRows = u.details.candidates
       .map((c) => `<tr class="${c.blocked_by_institution ? "row-blocked" : ""}">
           <td>${esc(c.name)}</td>
+          <td>${c.can_chair
+            ? '<span class="chair-ok">👑 可任主审</span>'
+            : '<span class="hint">无资格</span>'}</td>
           <td>${c.institution ? `🏛 ${esc(c.institution)}` : '<span class="hint">未填写</span>'}</td>
           <td>${c.remaining_capacity > 0
             ? `剩余容量 ${c.remaining_capacity}`
@@ -118,11 +124,19 @@ function renderAlerts() {
             ? '<span style="color:#178a52">主题全覆盖</span>'
             : `未覆盖主题 ${c.uncovered_topics} 个`}</td>
           <td>${c.blocked_by_institution
-            ? '<span class="excl">被机构上限排除</span>' : ""}</td>
+            ? '<span class="excl">被机构上限排除</span>'
+            : (c.can_chair ? "" : '<span class="hint">不可补主审</span>')}</td>
         </tr>`).join("");
     const instBlocked = u.details.blocked_by_institution || 0;
+    const gapTxt = u.deficit > 0
+      ? `需要 ${u.required} 名评审，仅安排 ${u.assigned} 名，缺 ${u.deficit} 名。`
+      : `${u.assigned} 名评审已全部到位。`;
+    const chairTxt = (u.required_chairs || 0) > 0
+      ? `主审需 ${u.required_chairs} 名、实际 ${u.assigned_chairs} 名`
+      + (u.chair_deficit ? `，<b style="color:#c63b3b">主审缺 ${u.chair_deficit} 名</b>` : "（已满足）")
+      : "";
     return `<div class="alert danger">
-      <strong>⛔ 《${esc(u.title)}》未满足：需要 ${u.required} 名评审，仅安排 ${u.assigned} 名，缺 ${u.deficit} 名。</strong>
+      <strong>⛔ 《${esc(u.title)}》未满足：${gapTxt}${chairTxt}</strong>
       <ul>${u.reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>
       <div class="reason-detail">
         <strong>可复核明细</strong>（共 ${u.details.reviewer_count} 名评审，
@@ -130,9 +144,11 @@ function renderAlerts() {
           u.details.assigned_here ? `，已评审本稿 ${u.details.assigned_here} 名（不可重复）` : ""}${
           instBlocked ? `，机构上限排除 ${instBlocked} 名` : ""}，
         其余剩余容量合计 ${u.details.candidate_remaining_capacity}${
-          instBlocked ? `；扣除机构上限后实际可用 ${u.details.effective_remaining_capacity}` : ""}）
+          instBlocked ? `；扣除机构上限后实际可用 ${u.details.effective_remaining_capacity}` : ""}${
+          u.details.chair_qualified_count != null
+            ? `；具主审资格 ${u.details.chair_qualified_count} 名` : ""}）
         <table>
-          <tr><th>评审人</th><th>机构</th><th>剩余容量</th><th>主题匹配</th><th>排除原因</th></tr>
+          <tr><th>评审人</th><th>主审资格</th><th>机构</th><th>剩余容量</th><th>主题匹配</th><th>排除原因</th></tr>
           ${detailRows}
         </table>
       </div>
@@ -151,20 +167,24 @@ function renderAssignments() {
   }
   $("#assignment-list").innerHTML = state.manuscripts.map((m) => {
     const assigns = state._assignByM[m.id] || [];
+    const chairIds = new Set(state.solution?.chairs?.[m.id] || []);
     const short = assigns.length < m.required_reviews;
+    const chairShort = (m.required_chairs || 0) > chairIds.size;
     const chips = assigns
       .slice()
       .sort((a, b) => (b.locked - a.locked) || a.reviewer_id - b.reviewer_id)
       .map((a) => {
         const r = state._rById[a.reviewer_id];
         const ci = costInfo(m.id, a.reviewer_id);
+        const isChair = chairIds.has(a.reviewer_id);
         const miss = ci && ci.uncovered_topics.length
           ? `<span class="tag miss">未覆盖：${ci.uncovered_topics.map(esc).join("、")}</span>`
           : "";
         const instTxt = r && r.institution ? `<span class="tag inst">🏛 ${esc(r.institution)}</span>` : "";
         const costTxt = ci ? `费用 ${ci.mismatch_cost + ci.load_cost}` : "锁定";
-        return `<span class="chip ${a.locked ? "locked" : ""} ${ci && ci.uncovered_topics.length ? "miss-penalty" : ""}">
-          ${a.locked ? "🔒" : "👤"} ${esc(r ? r.name : `#${a.reviewer_id}`)}
+        return `<span class="chip ${a.locked ? "locked" : ""} ${isChair ? "chair" : ""} ${ci && ci.uncovered_topics.length ? "miss-penalty" : ""}">
+          ${isChair ? "👑" : (a.locked ? "🔒" : "👤")} ${esc(r ? r.name : `#${a.reviewer_id}`)}
+          ${isChair ? '<span class="tag chair-tag">主审</span>' : ""}
           ${instTxt}
           <span class="cost">${costTxt}</span>
           ${miss}
@@ -178,7 +198,7 @@ function renderAssignments() {
     const usedIds = new Set(assigns.map((a) => a.reviewer_id));
     const options = state.reviewers
       .filter((r) => !usedIds.has(r.id) && !state._conflictSet.has(`${m.id}:${r.id}`))
-      .map((r) => `<option value="${r.id}">${esc(r.name)}（${r.institution ? esc(r.institution) + " · " : ""}剩余 ${Math.max(0, r.capacity - r.assigned)}）</option>`)
+      .map((r) => `<option value="${r.id}">${r.can_chair ? "👑 " : ""}${esc(r.name)}（${r.institution ? esc(r.institution) + " · " : ""}剩余 ${Math.max(0, r.capacity - r.assigned)}）</option>`)
       .join("");
     const manualLock = options
       ? `<div class="manual-lock">
@@ -188,13 +208,14 @@ function renderAssignments() {
         </div>`
       : "";
 
-    return `<div class="assignment-card ${short ? "short" : "satisfied"}">
+    return `<div class="assignment-card ${short || chairShort ? "short" : "satisfied"}">
       <div class="assignment-head">
         <div>
           <div class="assignment-title">《${esc(m.title)}》</div>
           <div class="entity-sub">主题：${m.topics.map((t) => `<span class="tag">${esc(t)}</span>`).join("") || "（未标注）"}</div>
         </div>
-        <span class="badge-count ${short ? "no" : "ok"}">${assigns.length} / ${m.required_reviews} 名评审</span>
+        <span class="badge-count ${short || chairShort ? "no" : "ok"}">${assigns.length} / ${m.required_reviews} 名评审
+          · 主审 ${chairIds.size} / ${m.required_chairs || 0}</span>
       </div>
       <div class="reviewer-chips">${chips || '<span class="hint">尚未分配</span>'}</div>
       ${compositionLine(m.id, assigns)}
@@ -244,6 +265,7 @@ function renderReviewerLoad() {
     const over = load > r.capacity;
     return `<div class="load-row">
       <div class="load-name">${esc(r.name)}
+        ${r.can_chair ? ' <span class="tag chair-tag">👑 可任主审</span>' : ""}
         <div class="entity-sub" style="width:130px">${
           (r.institution ? `🏛 ${esc(r.institution)}` : "") || r.topics.slice(0, 2).map(esc).join(" / ")}</div>
       </div>
@@ -269,6 +291,7 @@ function renderManuscripts() {
         <div class="entity-title">《${esc(m.title)}》</div>
         <div class="entity-sub">
           需求 ${m.required_reviews} 名评审 · 已安排 ${m.assigned || 0} ·
+          主审 ${m.required_chairs ? `需 ${m.required_chairs} 名` : "不要求"} ·
           主题：${m.topics.map((t) => `<span class="tag">${esc(t)}</span>`).join("") || "（未标注）"}
         </div>
       </div>
@@ -293,6 +316,7 @@ function renderReviewers() {
     <div class="entity-row">
       <div class="entity-main">
         <div class="entity-title">${esc(r.name)}
+          ${r.can_chair ? '<span class="tag chair-tag">👑 可任主审</span>' : ""}
           ${r.locked_assigned ? '<span class="tag locked-tag">🔒 ' + r.locked_assigned + ' 锁定</span>' : ""}
         </div>
         <div class="entity-sub">
@@ -360,7 +384,11 @@ function render() {
 function openModal(title, fields, onOk) {
   $("#modal-title").textContent = title;
   $("#modal-body").innerHTML =
-    `<div class="modal-body-row">${fields.map((f) => `
+    `<div class="modal-body-row">${fields.map((f) => f.type === "checkbox" ? `
+      <label class="modal-check">
+        <input type="checkbox" id="mf-${f.key}" ${f.value ? "checked" : ""} />
+        ${esc(f.label)}
+      </label>` : `
       <label>${esc(f.label)}
         <input type="${f.type || "text"}" id="mf-${f.key}" value="${esc(f.value ?? "")}"
           min="${f.min ?? ""}" max="${f.max ?? ""}" />
@@ -376,8 +404,9 @@ function openModal(title, fields, onOk) {
   $("#modal-ok").onclick = async () => {
     const values = {};
     for (const f of fields) {
-      const v = $(`#mf-${f.key}`).value;
-      values[f.key] = f.type === "number" ? Number(v) : v;
+      const el = $(`#mf-${f.key}`);
+      if (f.type === "checkbox") values[f.key] = el.checked;
+      else values[f.key] = f.type === "number" ? Number(el.value) : el.value;
     }
     try {
       await onOk(values);
@@ -423,15 +452,22 @@ function bindEvents() {
     e.preventDefault();
     const f = e.target;
     const req = f.required_reviews.value.trim();
+    const requiredReviews = req ? Number(req) : state.settings.default_required_reviews;
+    const requiredChairs = Number(f.required_chairs.value || 0);
+    if (requiredChairs > requiredReviews) {
+      return toast("需主审人数不能超过所需评审总数", true);
+    }
     await runAction(api("/api/manuscripts", {
       method: "POST",
       body: JSON.stringify({
         title: f.title.value,
         topics: f.topics.value,
-        required_reviews: req ? Number(req) : state.settings.default_required_reviews,
+        required_reviews: requiredReviews,
+        required_chairs: requiredChairs,
       }),
     }), "稿件已添加");
     f.reset();
+    f.required_chairs.value = 0;
   });
 
   // 新增评审人
@@ -446,6 +482,7 @@ function bindEvents() {
         topics: f.topics.value,
         institution: f.institution.value,
         capacity: cap ? Number(cap) : state.settings.default_capacity,
+        can_chair: f.can_chair.checked,
       }),
     }), "评审人已添加");
     f.reset();
@@ -466,8 +503,12 @@ function bindEvents() {
         { key: "title", label: "稿件主题/标题", value: m.title },
         { key: "topics", label: "主题（逗号分隔）", value: m.topics.join(", ") },
         { key: "required_reviews", label: "所需评审数", value: m.required_reviews, type: "number", min: 1, max: 20 },
+        { key: "required_chairs", label: "所需主审数（0~2，不超过评审数）", value: m.required_chairs || 0, type: "number", min: 0, max: 2 },
       ], async (v) => {
         if (!v.title.trim()) throw new Error("标题不能为空");
+        if (v.required_chairs > v.required_reviews) {
+          throw new Error("所需主审人数不能超过所需评审总数");
+        }
         await runAction(api(`/api/manuscripts/${m.id}`, {
           method: "PATCH",
           body: JSON.stringify(v),
@@ -484,6 +525,7 @@ function bindEvents() {
         { key: "topics", label: "擅长主题（逗号分隔）", value: r.topics.join(", ") },
         { key: "institution", label: "所属机构（可选，留空不计入机构上限）", value: r.institution || "" },
         { key: "capacity", label: "个人容量", value: r.capacity, type: "number", min: 0, max: 50 },
+        { key: "can_chair", label: "可任主审（具备主审资格）", value: !!r.can_chair, type: "checkbox" },
       ], async (v) => {
         if (!v.name.trim()) throw new Error("姓名不能为空");
         await runAction(api(`/api/reviewers/${r.id}`, {

@@ -36,9 +36,13 @@ def test_demo_solve_constraints() -> None:
     conn = _connect()
     try:
         sol = solve(conn)
-        # 演示数据刻意制造 1 篇未满足
+        # 演示数据刻意制造 2 篇未满足：
+        # M2 主审缺口（总人数够）、M4 总人数缺口（相容评审仅 1 名）
         assert not sol["fully_satisfied"]
-        assert len(sol["unmet"]) == 1
+        assert len(sol["unmet"]) == 2
+        unmet_by_id = {u["manuscript_id"]: u for u in sol["unmet"]}
+        assert unmet_by_id[2]["deficit"] == 0 and unmet_by_id[2]["chair_deficit"] == 1
+        assert unmet_by_id[4]["deficit"] == 2
 
         # 冲突边绝不出现在分配中
         conflicts = {
@@ -126,11 +130,13 @@ def _make_scenario(conn, cap: int) -> None:
     conn.execute("DELETE FROM reviewers")
     conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('manuscripts','reviewers')")
     conn.execute(
-        "INSERT INTO manuscripts(title, topics, required_reviews) VALUES (?, ?, ?)",
-        ("测试稿", json.dumps(["t"], ensure_ascii=False), 3))
+        "INSERT INTO manuscripts(title, topics, required_reviews, required_chairs) "
+        "VALUES (?, ?, ?, ?)",
+        ("测试稿", json.dumps(["t"], ensure_ascii=False), 3, 0))
     for name, inst in [("a1", "A"), ("a2", "A"), ("a3", "A"), ("b1", "B"), ("x1", "")]:
         conn.execute(
-            "INSERT INTO reviewers(name, topics, capacity, institution) VALUES (?, ?, ?, ?)",
+            "INSERT INTO reviewers(name, topics, capacity, institution, can_chair) "
+            "VALUES (?, ?, ?, ?, 0)",
             (name, json.dumps(["t"], ensure_ascii=False), 3, inst))
     set_setting(conn, "institution_cap", cap)
     conn.commit()
@@ -246,9 +252,257 @@ def test_schema_migration_adds_institution() -> None:
         init_db(seed_demo=False)
         c2 = sqlite3.connect(path)
         c2.row_factory = sqlite3.Row
-        row = c2.execute("SELECT name, institution FROM reviewers WHERE name='老评审'").fetchone()
+        row = c2.execute("SELECT name, institution, can_chair FROM reviewers WHERE name='老评审'").fetchone()
         assert row["institution"] == ""  # 既有数据保留，机构默认未填写
+        assert row["can_chair"] == 0    # 旧评审默认不具主审资格
         assert c2.execute("SELECT value FROM settings WHERE key='institution_cap'").fetchone()["value"] == "0"
+        c2.close()
+    finally:
+        db.DB_PATH = old_path
+
+
+def _make_chair_scenario(conn, required: int, chairs: int,
+                         qualified: set[str], capacities: dict[str, int] | None = None,
+                         institution_cap: int = 0) -> None:
+    """清空并构造 1 篇稿件（需求 required、主审 chairs）与 a1..a5 五名同主题评审；
+    qualified 中的评审人具备主审资格。"""
+    conn.execute("DELETE FROM assignments")
+    conn.execute("DELETE FROM conflicts")
+    conn.execute("DELETE FROM manuscripts")
+    conn.execute("DELETE FROM reviewers")
+    conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('manuscripts','reviewers')")
+    conn.execute(
+        "INSERT INTO manuscripts(title, topics, required_reviews, required_chairs) "
+        "VALUES (?, ?, ?, ?)",
+        ("主审稿", json.dumps(["t"], ensure_ascii=False), required, chairs))
+    for name in ["a1", "a2", "a3", "a4", "a5"]:
+        cap = (capacities or {}).get(name, 5)
+        conn.execute(
+            "INSERT INTO reviewers(name, topics, capacity, institution, can_chair) "
+            "VALUES (?, ?, ?, '', ?)",
+            (name, json.dumps(["t"], ensure_ascii=False), cap, 1 if name in qualified else 0))
+    set_setting(conn, "institution_cap", institution_cap)
+    conn.commit()
+
+
+def test_chairs_filled_by_qualified() -> None:
+    """主审名额由合资格评审人补齐；不合资格者不会被标记为主审。"""
+    conn = _connect()
+    try:
+        _make_chair_scenario(conn, required=3, chairs=2, qualified={"a3", "a5"})
+        sol = solve(conn)
+        assert sol["fully_satisfied"]
+        chairs = sol["chairs"].get(1) or sol["chairs"].get("1")
+        assert chairs == [3, 5]  # 合资格者按 ID 确定性出任主审
+        ids = {r["r_id"] for r in conn.execute("SELECT r_id FROM assignments WHERE m_id=1")}
+        assert ids == {3, 5} | (ids - {3, 5})  # 共 3 人，主审是其中 2 名
+        assert len(ids) == 3
+        for key, ec in sol["edge_costs"].items():
+            m_id = int(key.split(":")[0])
+            if m_id == 1:
+                assert ec["is_chair"] == (int(key.split(":")[1]) in {3, 5})
+    finally:
+        conn.close()
+
+
+def test_chair_deficit_reported_separately() -> None:
+    """主审不足但总人数够：仍给出最大可行分配，列入未满足，仅报主审缺口。"""
+    conn = _connect()
+    try:
+        # 5 名候选中只有 a2、a3 合资格；a2 出任本稿主审，a3 容量为 0（被其他稿占满）。
+        _make_chair_scenario(
+            conn, required=3, chairs=2, qualified={"a2", "a3"},
+            capacities={"a3": 0})
+        sol = solve(conn)
+        assert not sol["fully_satisfied"]
+        assert len(sol["unmet"]) == 1
+        u = sol["unmet"][0]
+        assert u["deficit"] == 0
+        assert u["chair_deficit"] == 1
+        assert u["required_chairs"] == 2 and u["assigned_chairs"] == 1
+        assert any("主审缺口 1 名" in r for r in u["reasons"])
+        # 总人数仍是最大可行分配（3 名）
+        assert conn.execute(
+            "SELECT COUNT(*) AS c FROM assignments WHERE m_id=1").fetchone()["c"] == 3
+        # 候选明细带资格与主审阻断原因（a2 已在本稿，不进入候选）
+        cands = {c["name"]: c for c in u["details"]["candidates"]}
+        assert "a2" not in cands
+        # a3 合资格但容量 0 -> 主审阻断原因为 no_capacity
+        assert cands["a3"]["can_chair"] is True
+        assert cands["a3"]["chair_available"] is False
+        assert cands["a3"]["chair_block_reason"] == "no_capacity"
+        assert any(not c["can_chair"] and c["chair_block_reason"] == "not_qualified"
+                   for c in cands.values())
+    finally:
+        conn.close()
+
+
+def test_unqualified_cannot_be_chair_even_if_scarce() -> None:
+    """无人合资格时：普通评审照常补齐总名额，主审缺口=所需主审数。"""
+    conn = _connect()
+    try:
+        _make_chair_scenario(conn, required=2, chairs=1, qualified=set())
+        sol = solve(conn)
+        u = sol["unmet"][0]
+        assert u["deficit"] == 0 and u["chair_deficit"] == 1
+        assert sol["total_chairs_assigned"] == 0
+        assert not any(ec["is_chair"] for ec in sol["edge_costs"].values())
+    finally:
+        conn.close()
+
+
+def test_chair_fallback_keeps_max_assignment() -> None:
+    """2 个主审名额但自由合资格者仅 1 人：主审缺 1、总人数仍最大，
+    且主审名额回流为普通名额时不会被误计为主审。"""
+    conn = _connect()
+    try:
+        _make_chair_scenario(conn, required=3, chairs=2, qualified={"a1"})
+        sol = solve(conn)
+        assert sol["total_assigned"] == 3
+        assert sol["total_chairs_assigned"] == 1
+        chairs = sol["chairs"].get(1) or sol["chairs"]["1"]
+        assert chairs == [1]
+        u = sol["unmet"][0]
+        assert u["deficit"] == 0 and u["chair_deficit"] == 1
+        # 费用还原（回流惩罚不出现在输出费用中）
+        recomputed = sum(
+            v["mismatch_cost"] + v["load_cost"]
+            for k, v in sol["edge_costs"].items() if k.startswith("1:"))
+        assert recomputed == sum(
+            v["mismatch_cost"] + v["load_cost"] for v in sol["edge_costs"].values())
+    finally:
+        conn.close()
+
+
+def test_locked_chairs_deducted_by_reviewer_id() -> None:
+    """有效锁定按评审人 ID 升序优先抵扣主审名额；主审同样占用容量与机构名额。"""
+    conn = _connect()
+    try:
+        # 机构上限 2：a1、a2 同属 A 机构且被锁定为主审，第三人不能再来自 A。
+        conn.execute("DELETE FROM assignments")
+        conn.execute("DELETE FROM conflicts")
+        conn.execute("DELETE FROM manuscripts")
+        conn.execute("DELETE FROM reviewers")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('manuscripts','reviewers')")
+        conn.execute(
+            "INSERT INTO manuscripts(title, topics, required_reviews, required_chairs) "
+            "VALUES (?, ?, ?, ?)",
+            ("锁主审稿", json.dumps(["t"], ensure_ascii=False), 3, 2))
+        for name, inst, q in [("a1", "A", 1), ("a2", "A", 1), ("a3", "A", 0),
+                              ("b1", "B", 0)]:
+            conn.execute(
+                "INSERT INTO reviewers(name, topics, capacity, institution, can_chair) "
+                "VALUES (?, ?, 5, ?, ?)",
+                (name, json.dumps(["t"], ensure_ascii=False), inst, q))
+        # 锁定 a1、a2（均合资格）-> 按 ID 升序抵扣 2 个主审名额
+        conn.execute(
+            "INSERT INTO assignments(m_id, r_id, locked) "
+            "SELECT 1, id, 1 FROM reviewers WHERE name IN ('a1','a2')")
+        set_setting(conn, "institution_cap", 2)
+        conn.commit()
+        sol = solve(conn)
+        chairs = sol["chairs"].get(1) or sol["chairs"]["1"]
+        assert chairs == [1, 2]
+        assert sol["fully_satisfied"]
+        # 第三人不得来自 A 机构（机构名额已被 2 个主审锁占满）
+        third = conn.execute(
+            """SELECT rv.institution AS inst FROM assignments a
+               JOIN reviewers rv ON a.r_id=rv.id
+               WHERE a.m_id=1 AND a.locked=0""").fetchone()
+        assert third["inst"] == "B"
+        # 主审锁定行被标识 is_chair
+        assert sol["edge_costs"]["1:1"]["is_chair"] is True
+        assert sol["edge_costs"]["1:2"]["is_chair"] is True
+    finally:
+        conn.close()
+
+
+def test_locked_non_qualified_not_chair() -> None:
+    """锁定了不具资格的人：不抵扣主审名额，主审由自由分配补齐，同一人不重复。"""
+    conn = _connect()
+    try:
+        _make_chair_scenario(conn, required=3, chairs=1, qualified={"a3", "a4"})
+        # 锁定 a1（不具资格）
+        conn.execute(
+            "INSERT INTO assignments(m_id, r_id, locked) "
+            "SELECT 1, id, 1 FROM reviewers WHERE name='a1'")
+        conn.commit()
+        sol = solve(conn)
+        assert sol["fully_satisfied"]
+        chairs = sol["chairs"].get(1) or sol["chairs"]["1"]
+        assert chairs == [3]  # 自由合资格者中 ID 最小者出任主审
+        assert sol["edge_costs"]["1:1"]["is_chair"] is False
+        ids = {r["r_id"] for r in conn.execute("SELECT r_id FROM assignments WHERE m_id=1")}
+        assert len(ids) == 3 and 1 in ids and 3 in ids
+    finally:
+        conn.close()
+
+
+def test_chairs_share_capacity_and_inst_quota() -> None:
+    """主审同时占用个人容量（跨稿）与每稿机构名额。"""
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM assignments")
+        conn.execute("DELETE FROM conflicts")
+        conn.execute("DELETE FROM manuscripts")
+        conn.execute("DELETE FROM reviewers")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('manuscripts','reviewers')")
+        for i, title in enumerate(["稿一", "稿二"], start=1):
+            conn.execute(
+                "INSERT INTO manuscripts(title, topics, required_reviews, required_chairs) "
+                "VALUES (?, ?, ?, ?)",
+                (title, json.dumps(["t"], ensure_ascii=False), 2, 1))
+        # 唯一合资格主审 r1 容量 1：两稿主审竞争，仅一稿能拿到主审
+        for name, cap, q in [("r1", 1, 1), ("r2", 5, 0), ("r3", 5, 0)]:
+            conn.execute(
+                "INSERT INTO reviewers(name, topics, capacity, institution, can_chair) "
+                "VALUES (?, ?, ?, '', ?)",
+                (name, json.dumps(["t"], ensure_ascii=False), cap, q))
+        conn.commit()
+        sol = solve(conn)
+        assert sol["total_chairs_required"] == 2
+        assert sol["total_chairs_assigned"] == 1
+        chair_ms = [int(k) for k, v in sol["chairs"].items() if v]
+        assert len(chair_ms) == 1
+        # 拿不到主审的稿子列入未满足（总人数缺口为 0）
+        unmet_ids = {u["manuscript_id"] for u in sol["unmet"]}
+        assert unmet_ids <= {1, 2} and len(unmet_ids) == 1
+        assert next(iter(unmet_ids)) not in chair_ms
+    finally:
+        conn.close()
+
+
+def test_schema_migration_adds_chair_columns() -> None:
+    """旧库（无 can_chair / required_chairs 列）启动迁移后自动补列且默认关闭主审约束。"""
+    path = os.path.join(tempfile.mkdtemp(prefix="review-chair-"), "old.db")
+    from app import db
+    old_path = db.DB_PATH
+    db.DB_PATH = path
+    try:
+        import sqlite3
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE reviewers (id INTEGER PRIMARY KEY, name TEXT, topics TEXT, "
+                  "capacity INTEGER, institution TEXT)")
+        c.execute("INSERT INTO reviewers(name, topics, capacity, institution) "
+                  "VALUES ('老评审','[]',3,'')")
+        c.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+        c.execute("CREATE TABLE manuscripts (id INTEGER PRIMARY KEY, title TEXT, topics TEXT, "
+                  "required_reviews INTEGER)")
+        c.execute("INSERT INTO manuscripts(title, topics, required_reviews) "
+                  "VALUES ('老稿件','[]',3)")
+        c.execute("CREATE TABLE conflicts (m_id INTEGER, r_id INTEGER)")
+        c.execute("CREATE TABLE assignments (id INTEGER PRIMARY KEY, m_id INTEGER, "
+                  "r_id INTEGER, locked INTEGER)")
+        c.commit()
+        c.close()
+
+        init_db(seed_demo=False)
+        c2 = sqlite3.connect(path)
+        c2.row_factory = sqlite3.Row
+        rv = c2.execute("SELECT can_chair FROM reviewers WHERE name='老评审'").fetchone()
+        mm = c2.execute("SELECT required_chairs FROM manuscripts WHERE title='老稿件'").fetchone()
+        assert rv["can_chair"] == 0       # 旧评审默认不具主审资格
+        assert mm["required_chairs"] == 0  # 旧稿件默认不需要主审（约束关闭）
         c2.close()
     finally:
         db.DB_PATH = old_path
@@ -262,4 +516,12 @@ if __name__ == "__main__":
     test_institution_lock_over_cap_warns_and_blocks()
     test_no_institution_reviewers_uncounted()
     test_schema_migration_adds_institution()
+    test_chairs_filled_by_qualified()
+    test_chair_deficit_reported_separately()
+    test_unqualified_cannot_be_chair_even_if_scarce()
+    test_chair_fallback_keeps_max_assignment()
+    test_locked_chairs_deducted_by_reviewer_id()
+    test_locked_non_qualified_not_chair()
+    test_chairs_share_capacity_and_inst_quota()
+    test_schema_migration_adds_chair_columns()
     print("所有冒烟测试通过 ✅")

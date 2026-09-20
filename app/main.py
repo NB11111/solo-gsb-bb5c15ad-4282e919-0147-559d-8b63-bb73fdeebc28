@@ -46,7 +46,8 @@ def build_state(conn: sqlite3.Connection) -> dict:
         return [
             {"id": r["id"], "title": r["title"],
              "topics": json.loads(r["topics"]),
-             "required_reviews": r["required_reviews"]}
+             "required_reviews": r["required_reviews"],
+             "required_chairs": r["required_chairs"]}
             for r in conn.execute("SELECT * FROM manuscripts ORDER BY id").fetchall()
         ]
 
@@ -54,7 +55,8 @@ def build_state(conn: sqlite3.Connection) -> dict:
         return [
             {"id": r["id"], "name": r["name"],
              "topics": json.loads(r["topics"]), "capacity": r["capacity"],
-             "institution": r["institution"] or ""}
+             "institution": r["institution"] or "",
+             "can_chair": bool(r["can_chair"])}
             for r in conn.execute("SELECT * FROM reviewers ORDER BY id").fetchall()
         ]
 
@@ -123,10 +125,12 @@ def api_state(conn=Depends(get_conn)):
 def create_manuscript(body: ManuscriptIn, conn=Depends(get_conn)):
     with transaction(conn):
         cur = conn.execute(
-            "INSERT INTO manuscripts(title, topics, required_reviews) VALUES (?, ?, ?)",
+            "INSERT INTO manuscripts(title, topics, required_reviews, required_chairs) "
+            "VALUES (?, ?, ?, ?)",
             (body.title.strip(),
              json.dumps(normalize_topics(body.topics), ensure_ascii=False),
-             body.required_reviews),
+             body.required_reviews,
+             body.required_chairs),
         )
     return build_state(conn) | {"created_id": cur.lastrowid}
 
@@ -144,8 +148,20 @@ def update_manuscript(m_id: int, body: ManuscriptPatch, conn=Depends(get_conn)):
     if body.required_reviews is not None:
         fields.append("required_reviews = ?")
         params.append(body.required_reviews)
+    if body.required_chairs is not None:
+        fields.append("required_chairs = ?")
+        params.append(body.required_chairs)
     if not fields:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
+    # 合并更新后的主审人数不得超过所需评审总数
+    row = conn.execute(
+        "SELECT required_reviews, required_chairs FROM manuscripts WHERE id = ?",
+        (m_id,),
+    ).fetchone()
+    req = body.required_reviews if body.required_reviews is not None else row["required_reviews"]
+    chairs = body.required_chairs if body.required_chairs is not None else row["required_chairs"]
+    if chairs > req:
+        raise HTTPException(status_code=400, detail="所需主审人数不得超过所需评审总数")
     params.append(m_id)
     with transaction(conn):
         conn.execute(f"UPDATE manuscripts SET {', '.join(fields)} WHERE id = ?", params)
@@ -165,11 +181,13 @@ def delete_manuscript(m_id: int, conn=Depends(get_conn)):
 def create_reviewer(body: ReviewerIn, conn=Depends(get_conn)):
     with transaction(conn):
         cur = conn.execute(
-            "INSERT INTO reviewers(name, topics, capacity, institution) VALUES (?, ?, ?, ?)",
+            "INSERT INTO reviewers(name, topics, capacity, institution, can_chair) "
+            "VALUES (?, ?, ?, ?, ?)",
             (body.name.strip(),
              json.dumps(normalize_topics(body.topics), ensure_ascii=False),
              body.capacity,
-             normalize_institution(body.institution)),
+             normalize_institution(body.institution),
+             1 if body.can_chair else 0),
         )
     return build_state(conn) | {"created_id": cur.lastrowid}
 
@@ -190,6 +208,9 @@ def update_reviewer(r_id: int, body: ReviewerPatch, conn=Depends(get_conn)):
     if body.institution is not None:
         fields.append("institution = ?")
         params.append(normalize_institution(body.institution))
+    if body.can_chair is not None:
+        fields.append("can_chair = ?")
+        params.append(1 if body.can_chair else 0)
     if not fields:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
     params.append(r_id)
