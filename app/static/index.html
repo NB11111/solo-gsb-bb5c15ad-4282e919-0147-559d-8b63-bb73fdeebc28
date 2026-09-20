@@ -12,7 +12,7 @@
       <span class="logo">⚖️</span>
       <div>
         <h1>匿名评审分配系统</h1>
-        <p class="subtitle">最小费用最大流 · 冲突与机构多样性硬约束 · 主题匹配与负载均衡联合优化</p>
+        <p class="subtitle">最小费用最大流 · 冲突/机构多样性/主审资格硬约束 · 主题匹配与负载均衡联合优化</p>
       </div>
     </div>
     <div class="actions">
@@ -84,6 +84,7 @@
           <input type="text" name="title" placeholder="稿件主题 / 标题" required maxlength="200" />
           <input type="text" name="topics" placeholder="主题（逗号分隔，如：机器学习, nlp）" />
           <input type="number" name="required_reviews" placeholder="所需评审数" min="1" max="20" />
+          <input type="number" name="required_leads" placeholder="需主审人数（0-2）" min="0" max="2" />
           <button class="btn primary" type="submit">添加稿件</button>
         </form>
       </div>
@@ -102,6 +103,9 @@
           <input type="text" name="topics" placeholder="擅长主题（逗号分隔）" />
           <input type="text" name="institution" placeholder="所属机构（可选，留空不计入机构上限）" maxlength="120" />
           <input type="number" name="capacity" placeholder="个人容量" min="0" max="50" />
+          <label class="checkbox-label" title="是否可担任主审（主审资格硬约束）">
+            <input type="checkbox" name="can_lead" /> 可任主审
+          </label>
           <button class="btn primary" type="submit">添加评审人</button>
         </form>
       </div>

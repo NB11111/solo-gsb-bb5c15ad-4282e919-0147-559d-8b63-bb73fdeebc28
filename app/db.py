@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS manuscripts (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     title            TEXT NOT NULL,
     topics           TEXT NOT NULL DEFAULT '[]',
-    required_reviews INTEGER NOT NULL DEFAULT 3
+    required_reviews INTEGER NOT NULL DEFAULT 3,
+    required_leads   INTEGER NOT NULL DEFAULT 0   -- 需主审人数（0~2 且不超过所需评审数；0 关闭主审约束）
 );
 
 CREATE TABLE IF NOT EXISTS reviewers (
@@ -67,7 +68,8 @@ CREATE TABLE IF NOT EXISTS reviewers (
     name        TEXT NOT NULL,
     topics      TEXT NOT NULL DEFAULT '[]',
     capacity    INTEGER NOT NULL DEFAULT 3,
-    institution TEXT NOT NULL DEFAULT ''   -- 可选所属机构；空串表示未填写（不计入机构上限）
+    institution TEXT NOT NULL DEFAULT '',  -- 可选所属机构；空串表示未填写（不计入机构上限）
+    can_lead    INTEGER NOT NULL DEFAULT 0  -- 是否可任主审（主审资格硬约束）
 );
 
 -- 作者冲突：稿件 m_id 与评审人 r_id 之间绝不允许出现分配边
@@ -112,11 +114,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """对既有数据库做幂等的轻量迁移（保留现有数据）。
 
     - reviewers.institution：评审人可选机构（旧库补列，默认空串=未填写）。
+    - reviewers.can_lead / manuscripts.required_leads：主审资格硬约束
+      （旧库补列，默认 0=不可任主审 / 不需主审，即该约束默认关闭）。
     新版本引入的设置项由 init_db 中的 INSERT OR IGNORE 补默认值。
     """
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(reviewers)")}
-    if "institution" not in cols:
+    rcols = {r["name"] for r in conn.execute("PRAGMA table_info(reviewers)")}
+    if "institution" not in rcols:
         conn.execute("ALTER TABLE reviewers ADD COLUMN institution TEXT NOT NULL DEFAULT ''")
+    if "can_lead" not in rcols:
+        conn.execute("ALTER TABLE reviewers ADD COLUMN can_lead INTEGER NOT NULL DEFAULT 0")
+    mcols = {r["name"] for r in conn.execute("PRAGMA table_info(manuscripts)")}
+    if "required_leads" not in mcols:
+        conn.execute("ALTER TABLE manuscripts ADD COLUMN required_leads INTEGER NOT NULL DEFAULT 0")
 
 
 def get_setting(conn: sqlite3.Connection, key: str) -> Any:
@@ -165,41 +174,45 @@ def normalize_institution(raw: str | None) -> str:
 def seed_demo_data(conn: sqlite3.Connection) -> None:
     """载入一组用于快速体验的演示数据（含一个容量不足样例）。"""
     ms = [
-        ("基于深度学习的机器翻译", ["机器学习", "nlp"], 3),
-        ("图神经网络推荐系统", ["机器学习", "推荐系统"], 3),
-        ("分布式数据库一致性协议", ["数据库", "分布式系统"], 3),
-        ("低功耗边缘计算架构", ["体系结构", "分布式系统"], 3),
-        ("大模型安全对齐", ["nlp", "安全"], 3),
+        # (标题, 主题, 所需评审数, 需主审人数)
+        ("基于深度学习的机器翻译", ["机器学习", "nlp"], 3, 1),
+        ("图神经网络推荐系统", ["机器学习", "推荐系统"], 3, 1),
+        ("分布式数据库一致性协议", ["数据库", "分布式系统"], 3, 1),
+        ("低功耗边缘计算架构", ["体系结构", "分布式系统"], 3, 1),
+        ("大模型安全对齐", ["nlp", "安全"], 3, 1),
     ]
     rs = [
         # 机构仅为演示机构多样性约束：清华 3 人、北大 1 人、中科院 1 人；
         # 孙老师未填机构，不受“每篇同机构最多人数”限制（但其容量为 0）。
-        ("张教授", ["机器学习", "nlp"], 3, "清华大学"),
-        ("李研究员", ["nlp", "安全"], 3, "清华大学"),
+        # 张教授、李研究员、钱教授标记“可任主审”，演示主审资格硬约束。
+        ("张教授", ["机器学习", "nlp"], 3, "清华大学", 1),
+        ("李研究员", ["nlp", "安全"], 3, "清华大学", 1),
         # 王老师只擅长数据库（不含“分布式系统”），且与 M4 冲突：
         # 于是 M4（体系结构/分布式系统）只有钱教授 1 名相容评审，
         # 钱教授容量仅 3、需求 3，在机构上限下仍只够 1 名，演示“未满足稿件与原因”。
-        ("王老师", ["数据库"], 3, "北京大学"),
-        ("赵博士", ["推荐系统", "机器学习"], 2, "清华大学"),
-        ("钱教授", ["体系结构", "分布式系统"], 3, "中科院"),
+        ("王老师", ["数据库"], 3, "北京大学", 0),
+        ("赵博士", ["推荐系统", "机器学习"], 2, "清华大学", 0),
+        ("钱教授", ["体系结构", "分布式系统"], 3, "中科院", 1),
         # 孙老师容量 0：全部容量之和 14 < 需求之和 15，形成全局性容量不足
-        ("孙老师", ["安全"], 0, ""),
+        ("孙老师", ["安全"], 0, "", 0),
     ]
     with transaction(conn):
         # 若在已有库上重新载入演示数据，重置自增序列，保证下面的 ID 引用确定。
         conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('manuscripts','reviewers')")
         m_ids: list[int] = []
-        for title, topics, req in ms:
+        for title, topics, req, leads in ms:
             cur = conn.execute(
-                "INSERT INTO manuscripts(title, topics, required_reviews) VALUES (?, ?, ?)",
-                (title, json.dumps(topics, ensure_ascii=False), req),
+                "INSERT INTO manuscripts(title, topics, required_reviews, required_leads) "
+                "VALUES (?, ?, ?, ?)",
+                (title, json.dumps(topics, ensure_ascii=False), req, leads),
             )
             m_ids.append(cur.lastrowid)
         r_ids: list[int] = []
-        for name, topics, cap, institution in rs:
+        for name, topics, cap, institution, can_lead in rs:
             cur = conn.execute(
-                "INSERT INTO reviewers(name, topics, capacity, institution) VALUES (?, ?, ?, ?)",
-                (name, json.dumps(topics, ensure_ascii=False), cap, institution),
+                "INSERT INTO reviewers(name, topics, capacity, institution, can_lead) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, json.dumps(topics, ensure_ascii=False), cap, institution, can_lead),
             )
             r_ids.append(cur.lastrowid)
         # M4（体系结构/分布式）与除钱教授外的所有评审人冲突，

@@ -46,7 +46,8 @@ def build_state(conn: sqlite3.Connection) -> dict:
         return [
             {"id": r["id"], "title": r["title"],
              "topics": json.loads(r["topics"]),
-             "required_reviews": r["required_reviews"]}
+             "required_reviews": r["required_reviews"],
+             "required_leads": r["required_leads"]}
             for r in conn.execute("SELECT * FROM manuscripts ORDER BY id").fetchall()
         ]
 
@@ -54,7 +55,8 @@ def build_state(conn: sqlite3.Connection) -> dict:
         return [
             {"id": r["id"], "name": r["name"],
              "topics": json.loads(r["topics"]), "capacity": r["capacity"],
-             "institution": r["institution"] or ""}
+             "institution": r["institution"] or "",
+             "can_lead": bool(r["can_lead"])}
             for r in conn.execute("SELECT * FROM reviewers ORDER BY id").fetchall()
         ]
 
@@ -121,12 +123,19 @@ def api_state(conn=Depends(get_conn)):
 # ----------------------------------------------------------------- 稿件
 @app.post("/api/manuscripts")
 def create_manuscript(body: ManuscriptIn, conn=Depends(get_conn)):
+    if body.required_leads > body.required_reviews:
+        raise HTTPException(
+            status_code=400,
+            detail=f"需主审人数（{body.required_leads}）不得超过所需评审数（{body.required_reviews}）。",
+        )
     with transaction(conn):
         cur = conn.execute(
-            "INSERT INTO manuscripts(title, topics, required_reviews) VALUES (?, ?, ?)",
+            "INSERT INTO manuscripts(title, topics, required_reviews, required_leads) "
+            "VALUES (?, ?, ?, ?)",
             (body.title.strip(),
              json.dumps(normalize_topics(body.topics), ensure_ascii=False),
-             body.required_reviews),
+             body.required_reviews,
+             body.required_leads),
         )
     return build_state(conn) | {"created_id": cur.lastrowid}
 
@@ -144,8 +153,24 @@ def update_manuscript(m_id: int, body: ManuscriptPatch, conn=Depends(get_conn)):
     if body.required_reviews is not None:
         fields.append("required_reviews = ?")
         params.append(body.required_reviews)
+    if body.required_leads is not None:
+        fields.append("required_leads = ?")
+        params.append(body.required_leads)
     if not fields:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
+    # 主审人数不得超过所需评审数：与库中现有值合并后校验
+    if body.required_reviews is not None or body.required_leads is not None:
+        row = conn.execute(
+            "SELECT required_reviews, required_leads FROM manuscripts WHERE id = ?",
+            (m_id,),
+        ).fetchone()
+        new_req = body.required_reviews if body.required_reviews is not None else row["required_reviews"]
+        new_leads = body.required_leads if body.required_leads is not None else row["required_leads"]
+        if new_leads > new_req:
+            raise HTTPException(
+                status_code=400,
+                detail=f"需主审人数（{new_leads}）不得超过所需评审数（{new_req}）。",
+            )
     params.append(m_id)
     with transaction(conn):
         conn.execute(f"UPDATE manuscripts SET {', '.join(fields)} WHERE id = ?", params)
@@ -165,11 +190,13 @@ def delete_manuscript(m_id: int, conn=Depends(get_conn)):
 def create_reviewer(body: ReviewerIn, conn=Depends(get_conn)):
     with transaction(conn):
         cur = conn.execute(
-            "INSERT INTO reviewers(name, topics, capacity, institution) VALUES (?, ?, ?, ?)",
+            "INSERT INTO reviewers(name, topics, capacity, institution, can_lead) "
+            "VALUES (?, ?, ?, ?, ?)",
             (body.name.strip(),
              json.dumps(normalize_topics(body.topics), ensure_ascii=False),
              body.capacity,
-             normalize_institution(body.institution)),
+             normalize_institution(body.institution),
+             1 if body.can_lead else 0),
         )
     return build_state(conn) | {"created_id": cur.lastrowid}
 
@@ -190,6 +217,9 @@ def update_reviewer(r_id: int, body: ReviewerPatch, conn=Depends(get_conn)):
     if body.institution is not None:
         fields.append("institution = ?")
         params.append(normalize_institution(body.institution))
+    if body.can_lead is not None:
+        fields.append("can_lead = ?")
+        params.append(1 if body.can_lead else 0)
     if not fields:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
     params.append(r_id)

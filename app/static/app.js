@@ -58,6 +58,8 @@ function indexMaps() {
     (state._assignByM[a.manuscript_id] ||= []).push(a);
   }
   state._conflictSet = new Set(state.conflicts.map((c) => `${c.manuscript_id}:${c.reviewer_id}`));
+  // 实际主审（稿件:评审人）集合，由最近一次求解结果给出
+  state._leadSet = new Set((state.solution?.lead_pairs || []).map(([m, r]) => `${m}:${r}`));
 }
 
 function renderSummary() {
@@ -69,6 +71,8 @@ function renderSummary() {
         sol.total_assigned >= sol.total_required ? "ok" : "bad"),
       stat(sol.fully_satisfied ? "完整" : `${sol.unmet.length} 篇未满足`,
         "分配完整性", sol.fully_satisfied ? "ok" : "bad"),
+      stat(`${sol.total_lead_assigned ?? 0} / ${sol.total_lead_required ?? 0}`, "主审已认定 / 共需",
+        (sol.total_lead_assigned ?? 0) >= (sol.total_lead_required ?? 0) ? "ok" : "bad"),
       stat(sol.total_cost, "目标函数总费用（越小越优）"),
       stat(sol.locked_count, "锁定的既有分配"),
       stat(sol.total_capacity, "评审人总容量"),
@@ -110,6 +114,9 @@ function renderAlerts() {
     const detailRows = u.details.candidates
       .map((c) => `<tr class="${c.blocked_by_institution ? "row-blocked" : ""}">
           <td>${esc(c.name)}</td>
+          <td>${c.can_lead
+            ? '<span class="tag lead-tag">⭐ 可任主审</span>'
+            : '<span class="hint">—</span>'}</td>
           <td>${c.institution ? `🏛 ${esc(c.institution)}` : '<span class="hint">未填写</span>'}</td>
           <td>${c.remaining_capacity > 0
             ? `剩余容量 ${c.remaining_capacity}`
@@ -121,8 +128,11 @@ function renderAlerts() {
             ? '<span class="excl">被机构上限排除</span>' : ""}</td>
         </tr>`).join("");
     const instBlocked = u.details.blocked_by_institution || 0;
+    const headParts = [];
+    if (u.deficit > 0) headParts.push(`需要 ${u.required} 名评审，仅安排 ${u.assigned} 名，缺 ${u.deficit} 名`);
+    if (u.lead_deficit > 0) headParts.push(`需主审 ${u.lead_required} 名，实际 ${u.lead_assigned} 名，主审缺口 ${u.lead_deficit} 名`);
     return `<div class="alert danger">
-      <strong>⛔ 《${esc(u.title)}》未满足：需要 ${u.required} 名评审，仅安排 ${u.assigned} 名，缺 ${u.deficit} 名。</strong>
+      <strong>⛔ 《${esc(u.title)}》未满足：${headParts.join("；")}。</strong>
       <ul>${u.reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>
       <div class="reason-detail">
         <strong>可复核明细</strong>（共 ${u.details.reviewer_count} 名评审，
@@ -130,9 +140,10 @@ function renderAlerts() {
           u.details.assigned_here ? `，已评审本稿 ${u.details.assigned_here} 名（不可重复）` : ""}${
           instBlocked ? `，机构上限排除 ${instBlocked} 名` : ""}，
         其余剩余容量合计 ${u.details.candidate_remaining_capacity}${
-          instBlocked ? `；扣除机构上限后实际可用 ${u.details.effective_remaining_capacity}` : ""}）
+          instBlocked ? `；扣除机构上限后实际可用 ${u.details.effective_remaining_capacity}` : ""}${
+          u.lead_required > 0 ? `；可任主审者 ${u.details.lead_pool} 名、当前可补充主审 ${u.details.lead_available} 名` : ""}）
         <table>
-          <tr><th>评审人</th><th>机构</th><th>剩余容量</th><th>主题匹配</th><th>排除原因</th></tr>
+          <tr><th>评审人</th><th>主审资格</th><th>机构</th><th>剩余容量</th><th>主题匹配</th><th>排除原因</th></tr>
           ${detailRows}
         </table>
       </div>
@@ -152,19 +163,23 @@ function renderAssignments() {
   $("#assignment-list").innerHTML = state.manuscripts.map((m) => {
     const assigns = state._assignByM[m.id] || [];
     const short = assigns.length < m.required_reviews;
+    const leadGot = assigns.filter((a) => state._leadSet.has(`${m.id}:${a.reviewer_id}`)).length;
+    const leadShort = (m.required_leads || 0) > leadGot;
     const chips = assigns
       .slice()
       .sort((a, b) => (b.locked - a.locked) || a.reviewer_id - b.reviewer_id)
       .map((a) => {
         const r = state._rById[a.reviewer_id];
+        const isLead = state._leadSet.has(`${m.id}:${a.reviewer_id}`);
         const ci = costInfo(m.id, a.reviewer_id);
         const miss = ci && ci.uncovered_topics.length
           ? `<span class="tag miss">未覆盖：${ci.uncovered_topics.map(esc).join("、")}</span>`
           : "";
         const instTxt = r && r.institution ? `<span class="tag inst">🏛 ${esc(r.institution)}</span>` : "";
         const costTxt = ci ? `费用 ${ci.mismatch_cost + ci.load_cost}` : "锁定";
-        return `<span class="chip ${a.locked ? "locked" : ""} ${ci && ci.uncovered_topics.length ? "miss-penalty" : ""}">
+        return `<span class="chip ${a.locked ? "locked" : ""} ${isLead ? "lead" : ""} ${ci && ci.uncovered_topics.length ? "miss-penalty" : ""}">
           ${a.locked ? "🔒" : "👤"} ${esc(r ? r.name : `#${a.reviewer_id}`)}
+          ${isLead ? '<span class="tag lead-tag" title="实际主审">⭐ 主审</span>' : ""}
           ${instTxt}
           <span class="cost">${costTxt}</span>
           ${miss}
@@ -188,13 +203,18 @@ function renderAssignments() {
         </div>`
       : "";
 
-    return `<div class="assignment-card ${short ? "short" : "satisfied"}">
+    return `<div class="assignment-card ${short || leadShort ? "short" : "satisfied"}">
       <div class="assignment-head">
         <div>
           <div class="assignment-title">《${esc(m.title)}》</div>
           <div class="entity-sub">主题：${m.topics.map((t) => `<span class="tag">${esc(t)}</span>`).join("") || "（未标注）"}</div>
         </div>
-        <span class="badge-count ${short ? "no" : "ok"}">${assigns.length} / ${m.required_reviews} 名评审</span>
+        <div>
+          <span class="badge-count ${short ? "no" : "ok"}">${assigns.length} / ${m.required_reviews} 名评审</span>
+          ${(m.required_leads || 0) > 0
+            ? `<span class="badge-count ${leadShort ? "no" : "ok"}" title="实际主审 / 需主审">⭐ ${leadGot} / ${m.required_leads} 主审</span>`
+            : ""}
+        </div>
       </div>
       <div class="reviewer-chips">${chips || '<span class="hint">尚未分配</span>'}</div>
       ${compositionLine(m.id, assigns)}
@@ -268,7 +288,7 @@ function renderManuscripts() {
       <div class="entity-main">
         <div class="entity-title">《${esc(m.title)}》</div>
         <div class="entity-sub">
-          需求 ${m.required_reviews} 名评审 · 已安排 ${m.assigned || 0} ·
+          需求 ${m.required_reviews} 名评审${m.required_leads ? `（含主审 ${m.required_leads} 名）` : ""} · 已安排 ${m.assigned || 0} ·
           主题：${m.topics.map((t) => `<span class="tag">${esc(t)}</span>`).join("") || "（未标注）"}
         </div>
       </div>
@@ -282,6 +302,8 @@ function renderManuscripts() {
   const defReq = state.settings.default_required_reviews;
   const reqInput = $('form#form-manuscript [name="required_reviews"]');
   if (reqInput && !reqInput.dataset.touched) reqInput.placeholder = `所需评审数（默认 ${defReq}）`;
+  const leadsInput = $('form#form-manuscript [name="required_leads"]');
+  if (leadsInput && !leadsInput.dataset.touched) leadsInput.placeholder = "需主审人数 0-2（默认 0）";
 }
 
 function renderReviewers() {
@@ -293,6 +315,7 @@ function renderReviewers() {
     <div class="entity-row">
       <div class="entity-main">
         <div class="entity-title">${esc(r.name)}
+          ${r.can_lead ? '<span class="tag lead-tag">⭐ 可任主审</span>' : ""}
           ${r.locked_assigned ? '<span class="tag locked-tag">🔒 ' + r.locked_assigned + ' 锁定</span>' : ""}
         </div>
         <div class="entity-sub">
@@ -360,7 +383,10 @@ function render() {
 function openModal(title, fields, onOk) {
   $("#modal-title").textContent = title;
   $("#modal-body").innerHTML =
-    `<div class="modal-body-row">${fields.map((f) => `
+    `<div class="modal-body-row">${fields.map((f) => f.type === "checkbox" ? `
+      <label class="checkbox-label">${esc(f.label)}
+        <input type="checkbox" id="mf-${f.key}" ${f.value ? "checked" : ""} />
+      </label>` : `
       <label>${esc(f.label)}
         <input type="${f.type || "text"}" id="mf-${f.key}" value="${esc(f.value ?? "")}"
           min="${f.min ?? ""}" max="${f.max ?? ""}" />
@@ -376,8 +402,9 @@ function openModal(title, fields, onOk) {
   $("#modal-ok").onclick = async () => {
     const values = {};
     for (const f of fields) {
-      const v = $(`#mf-${f.key}`).value;
-      values[f.key] = f.type === "number" ? Number(v) : v;
+      const el = $(`#mf-${f.key}`);
+      values[f.key] = f.type === "checkbox" ? el.checked
+        : f.type === "number" ? Number(el.value) : el.value;
     }
     try {
       await onOk(values);
@@ -418,17 +445,19 @@ function bindEvents() {
     await runAction(api("/api/reset", { method: "POST" }), "已清空");
   });
 
-  // 新增稿件（required_reviews 留空时用默认值）
+  // 新增稿件（required_reviews / required_leads 留空时用默认值）
   $("#form-manuscript").addEventListener("submit", async (e) => {
     e.preventDefault();
     const f = e.target;
     const req = f.required_reviews.value.trim();
+    const leads = f.required_leads.value.trim();
     await runAction(api("/api/manuscripts", {
       method: "POST",
       body: JSON.stringify({
         title: f.title.value,
         topics: f.topics.value,
         required_reviews: req ? Number(req) : state.settings.default_required_reviews,
+        required_leads: leads ? Number(leads) : 0,
       }),
     }), "稿件已添加");
     f.reset();
@@ -446,6 +475,7 @@ function bindEvents() {
         topics: f.topics.value,
         institution: f.institution.value,
         capacity: cap ? Number(cap) : state.settings.default_capacity,
+        can_lead: f.can_lead.checked,
       }),
     }), "评审人已添加");
     f.reset();
@@ -466,6 +496,7 @@ function bindEvents() {
         { key: "title", label: "稿件主题/标题", value: m.title },
         { key: "topics", label: "主题（逗号分隔）", value: m.topics.join(", ") },
         { key: "required_reviews", label: "所需评审数", value: m.required_reviews, type: "number", min: 1, max: 20 },
+        { key: "required_leads", label: "需主审人数（0-2，不超过所需评审数）", value: m.required_leads ?? 0, type: "number", min: 0, max: 2 },
       ], async (v) => {
         if (!v.title.trim()) throw new Error("标题不能为空");
         await runAction(api(`/api/manuscripts/${m.id}`, {
@@ -484,6 +515,7 @@ function bindEvents() {
         { key: "topics", label: "擅长主题（逗号分隔）", value: r.topics.join(", ") },
         { key: "institution", label: "所属机构（可选，留空不计入机构上限）", value: r.institution || "" },
         { key: "capacity", label: "个人容量", value: r.capacity, type: "number", min: 0, max: 50 },
+        { key: "can_lead", label: "可任主审（主审资格硬约束）", value: !!r.can_lead, type: "checkbox" },
       ], async (v) => {
         if (!v.name.trim()) throw new Error("姓名不能为空");
         await runAction(api(`/api/reviewers/${r.id}`, {
